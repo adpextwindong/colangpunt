@@ -1,0 +1,64 @@
+cabal-version:      3.0
+name:               colangpunt
+version:            0.1.0.0
+author:             Takumi Crary
+maintainer:         tcrary@gmail.com
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall
+
+common libs
+    build-depends:    containers
+                     ,mtl
+                     ,clock
+                     ,pqueue
+                     ,transformers-base
+                     ,lifted-base
+
+library
+    import:           warnings
+                     ,libs
+    exposed-modules:  MyLib
+    build-depends:    base ^>=4.16.3.0
+    hs-source-dirs:   src
+    default-language: Haskell2010
+
+executable app
+    import:           warnings
+                     ,libs
+
+    main-is:          Main.hs
+    build-depends:
+        base ^>=4.16.3.0,
+        colangpunt
+
+    hs-source-dirs:   app
+    default-language: Haskell2010
+
+test-suite colangpunt-test
+    -- Import common warning flags.
+    import:           warnings
+
+    -- Base language which the package is written in.
+    default-language: Haskell2010
+
+    -- Modules included in this executable, other than Main.
+    -- other-modules:
+
+    -- LANGUAGE extensions used by modules in this package.
+    -- other-extensions:
+
+    -- The interface type and version of the test suite.
+    type:             exitcode-stdio-1.0
+
+    -- Directories containing source files.
+    hs-source-dirs:   test
+
+    -- The entrypoint to the test suite.
+    main-is:          Main.hs
+
+    -- Test dependencies.
+    build-depends:
+        base ^>=4.16.3.0,
+        colangpunt
