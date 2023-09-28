@@ -14,6 +14,7 @@ common libs
                      ,clock
                      ,pqueue
                      ,transformers-base
+                     ,transformers
                      ,lifted-base
 
 library
