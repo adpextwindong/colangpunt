@@ -37,13 +37,19 @@ data Stmt
 
 data InterpreterState = InterpreterState
   { isEnv :: Env
-  , isCoroutines :: Queue (Coroutine ())
+  , isReadyCoroutines :: Queue (Coroutine ())
+  , isPausedCoroutines :: Queue (Paused (Coroutine ())) --Yieled coroutines go here till the ready ones finish
   }
+
+newtype Paused a = Paused a --Is this necessary?
+
+mkPaused :: Coroutine a -> Paused (Coroutine a)
+mkPaused = Paused
 
 data Exception
   = Return Value
   | RuntimeError String
-  | CoroutineQueueEmpty
+  | ReadyCoroutineQueueEmpty
 
 --TODO
 
@@ -68,7 +74,7 @@ builtinEnv :: IO Env
 builtinEnv = return M.empty
 
 initInterpreterState :: IO InterpreterState
-initInterpreterState = InterpreterState <$> builtinEnv <*> newQueue
+initInterpreterState = InterpreterState <$> builtinEnv <*> newQueue <*> newQueue
 
 currentSystemTime :: MonadIO m => m TimeSpec
 currentSystemTime = liftIO $ getTime Monotonic
@@ -107,76 +113,96 @@ newCoroutine :: Env -> (a -> Interpreter ()) -> Interpreter (Coroutine a)
 newCoroutine env k = do
   return $ Coroutine env k
 
-scheduleCoroutine :: Coroutine () -> Interpreter ()
-scheduleCoroutine coroutine =
-  gets isCoroutines >>= enqueue coroutine
+scheduleReadyCoroutine :: Coroutine () -> Interpreter ()
+scheduleReadyCoroutine coroutine =
+  gets isReadyCoroutines >>= enqueue coroutine
 
-runNextCoroutine :: Interpreter ()
-runNextCoroutine =
-  gets isCoroutines >>= dequeue >>= \case
-    Nothing -> throwError CoroutineQueueEmpty
+runNextReadyCoroutine :: Interpreter ()
+runNextReadyCoroutine =
+  gets isReadyCoroutines >>= dequeue >>= \case
+    Nothing -> throwError ReadyCoroutineQueueEmpty
     Just Coroutine {..} -> do
       --setEnv corEnv
       corCont ()
+
+schedulePausedCoroutine :: Paused (Coroutine ()) -> Interpreter ()
+schedulePausedCoroutine (Paused coroutine) =
+  gets isPausedCoroutines >>= enqueue (mkPaused coroutine)
+
+--Move paused coroutines onto ready coroutine queue
+unpauseFrame :: Interpreter ()
+unpauseFrame = do
+  readies <- gets isReadyCoroutines
+  gets isPausedCoroutines >>= dequeue >>= \case
+    Nothing -> return ()
+    Just (Paused c) -> do
+      enqueue c readies
+      unpauseFrame
 
 yield :: Interpreter ()
 yield = do
   env <- gets isEnv
   callCC $ \cont -> do
-    newCoroutine env cont >>= scheduleCoroutine
-    runNextCoroutine
+    newCoroutine env cont >>= schedulePausedCoroutine . mkPaused
+    runNextReadyCoroutine
 
 execute :: Stmt -> Interpreter ()
 execute = \case
   PrintStmt s -> liftIO $ print s
   YieldStmt -> yield
-  --SleepStmt t -> undefined --TODO
+  --SleepStmt t -> undefined --TODOLANGFAR
   s@(DoWhile b) -> traverse_ execute b >> execute s
 
-awaitTermination :: Interpreter ()
-awaitTermination = do
-  coroutines <- readIORef =<< gets isCoroutines
-  unless (PQ.null coroutines) $ yield >> awaitTermination
+awaitFrame :: Interpreter ()
+awaitFrame = do --TODO run till ready coroutines are exhausted
+  readyCoroutines <- readIORef =<< gets isReadyCoroutines
+  unless (PQ.null readyCoroutines) $ yield
 
 type Program = [Stmt]
 
 scheduleProgram :: Program -> Interpreter ()
 scheduleProgram prog =
   --TODO builtinenv would go here
-  scheduleCoroutine $ Coroutine M.empty $ \() -> do
+  scheduleReadyCoroutine $ Coroutine M.empty $ \() -> do
     traverse_ execute prog
-    runNextCoroutine
+    runNextReadyCoroutine
 
+bothQueuesEmpty :: InterpreterState -> IO Bool
+bothQueuesEmpty is = do
+  rq <- readIORef $ isReadyCoroutines is
+  pq <- readIORef $ isPausedCoroutines is
+  return $ PQ.null rq && PQ.null pq
+
+runInterpreterT :: InterpreterState -> Interpreter () -> IO (Either Exception (), InterpreterState)
+runInterpreterT s = flip runStateT s
+                  . flip runContT return
+                  . runExceptT
+                  . runInterpreter
+
+-- Initializes the interpreter state and schedules the programs before running the progs
 interpretProgs :: [Program] -> IO (Either String ())
 interpretProgs programs = do
-  state <- initInterpreterState
-  retVal <- flip evalStateT state
-    . flip runContT return
-    . runExceptT
-    . runInterpreter
+  s <- initInterpreterState
+  (_, s') <- runInterpreterT s $ do
+        traverse_ scheduleProgram programs
+  interpretProgs' programs s'
+
+-- Runs ready coroutines till completion then runs the interpretProgs' again
+-- We can adapt this to the game easier this way
+interpretProgs' :: [Program] -> InterpreterState -> IO (Either String ())
+interpretProgs' programs state = do
+  (retVal, s') <- runInterpreterT state
     $ do
-      traverse_ scheduleProgram programs
-      liftIO $ print "Starting coroutines"
-      runNextCoroutine >> awaitTermination
+      liftIO $ putStrLn "Starting coroutines"
+      unpauseFrame >> runNextReadyCoroutine -- >> awaitFrame >> unpauseFrame
   case retVal of
     Left (RuntimeError err) -> return $ Left err
     Left (Return _) -> return $ Left "Cannot return from outside functions"
-    Left CoroutineQueueEmpty -> return $ Right ()
-    Right _ -> return $ Right ()
-
-
-interpret :: Program -> IO (Either String ())
-interpret program = do
-  state <- initInterpreterState
-  retVal <- flip evalStateT state
-    . flip runContT return
-    . runExceptT
-    . runInterpreter
-    $ (traverse_ execute program >> awaitTermination)
-  case retVal of
-    Left (RuntimeError err) -> return $ Left err
-    Left (Return _) -> return $ Left "Cannot return from outside functions"
-    Left CoroutineQueueEmpty -> return $ Right ()
+    Left ReadyCoroutineQueueEmpty -> do
+      finished <- bothQueuesEmpty s'
+      if not finished
+      then interpretProgs' programs s'
+      else return $ Right ()
     Right _ -> return $ Right ()
 
 p1 = [PrintStmt "foo"]
@@ -196,5 +222,4 @@ p1y = [PrintStmt "quux", YieldStmt]
 p1w = [DoWhile [PrintStmt "foo", YieldStmt]]
 p2w = [DoWhile [PrintStmt "bar", YieldStmt]]
 
---TODO scheme to run all coroutines till yield, not till awaitTermination
 --TODO give example of running this in an AppM stack with a larger state record and plumb IORefs for a script to touch
